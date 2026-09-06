@@ -189,6 +189,11 @@ jobs:
       - name: Run dev/skills/harness-curate/scripts/record_run.py --test
         run: python3 dev/skills/harness-curate/scripts/record_run.py --test
 
+      # Owns the harness-capture note-store contract: mandatory fields, the hygiene
+      # rejections, and the NO-STORE/EMPTY/PENDING exit codes the skill branches on.
+      - name: Run dev/skills/harness-capture/scripts/session_notes.py --test
+        run: python3 dev/skills/harness-capture/scripts/session_notes.py --test
+
   bump-version-test:
     name: bump-version.sh regression test
     runs-on: ubuntu-latest

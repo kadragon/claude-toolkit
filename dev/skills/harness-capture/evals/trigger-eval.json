@@ -2,8 +2,11 @@
   {"query": "retrospect this conversation and capture any reusable lesson", "should_trigger": true},
   {"query": "did we learn anything worth persisting to auto-memory or docs this session?", "should_trigger": true},
   {"query": "tidy the auto-memory store — dedup stale entries and fix the MEMORY.md index", "should_trigger": true},
+  {"query": "route this session's reusable lesson to docs or auto-memory before I commit", "should_trigger": true},
+  {"query": "retrospect the conversation and route what we captured to the right file", "should_trigger": true},
 
   {"query": "mine session transcripts across my projects and prune unused harness assets", "should_trigger": false},
   {"query": "set up AGENTS.md and the docs index for this new repo", "should_trigger": false},
-  {"query": "write a design doc for the new caching layer", "should_trigger": false}
+  {"query": "write a design doc for the new caching layer", "should_trigger": false},
+  {"query": "run the review cycle and merge this branch", "should_trigger": false}
 ]

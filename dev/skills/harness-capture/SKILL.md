@@ -4,7 +4,7 @@ description: >-
   Retrospect on the CURRENT conversation — route any reusable lesson to docs/,
   auto-memory, or CLAUDE.md/AGENTS.md, and tidy the auto-memory store. Also the
   signal-gated retrospect in task-review. Cross-session mining → harness-curate.
-version: 3.0.0
+version: 3.1.0
 ---
 
 # Capture Learnings — session retrospective
@@ -23,11 +23,73 @@ something worth saving?"
 Not for cross-project audits, unused-skill cleanup, or building a named asset → `harness-curate`
 / `skill-creator`.
 
+## Capture on the spot
+
+The retrospective's failure mode was never a bad gate — it was that nothing reached the gate. A
+signal noticed at turn 12 and recalled at turn 90 is a signal a compaction can delete, and
+"remember to mention this later" fails hardest in exactly the sessions that produce the best
+material. So the capture is a write, at the moment, not an intention.
+
+**Write the note as a JSON file, then hand the file to the store.** A note quotes what actually
+happened — an error message, the user's words, a diff — and text like that can contain `$(...)`,
+which the shell expands before the script ever sees it. Same reason the memory-guard pre-check
+below takes a file rather than a command line. Draft it with the `Write` tool, outside the store:
+
+```sh
+SKILL_DIR="<absolute parent directory of the loaded SKILL.md>"
+NOTES="$SKILL_DIR/scripts/session_notes.py"
+DRAFT="<absolute path of the scratch .json file you just wrote>"
+PY=$(command -v python3 || command -v python || true)
+if [ -n "$PY" ]; then "$PY" "$NOTES" add --from-json "$DRAFT"; else echo "no python on PATH" >&2; fi
+```
+
+The draft is one JSON object. All four bodies are mandatory and refused empty:
+
+| Field | What goes in it |
+|-------|-----------------|
+| `title` | one line, so a later scan can tell the notes apart |
+| `issue` | what happened, specific enough to reconstruct weeks later without this conversation |
+| `improvement` | the concrete delta — name the file and section, or the asset that does not exist yet |
+| `principle` | the generalisable takeaway. If you cannot state one, this was task context: do not capture it |
+| `target` | optional — the asset the note is about (`dev:task-next`, `docs/conventions.md`, a hook) |
+
+**Two triggers, both bound to something already in the tool record** — never to noticing that a
+moment qualifies:
+
+1. **Capture** — a user correction, an error→recovery gotcha, or a workflow you would repeat
+   surfaces. Write the note in the same turn or the next.
+2. **Flush** — any action declaring a unit of work complete: a commit, a PR opened or merged, a
+   final report, a queue item marked done, or this skill being invoked. List, route what it
+   prints through *How to run* below, then flush **through the highest id it listed** — a bare
+   flush would also retire a note captured while you were routing, which would leave the queue
+   having never been read:
+
+```sh
+SKILL_DIR="<absolute parent directory of the loaded SKILL.md>"
+NOTES="$SKILL_DIR/scripts/session_notes.py"
+PY=$(command -v python3 || command -v python || true)
+if [ -n "$PY" ]; then "$PY" "$NOTES" list; fi          # route what it prints, then:
+THROUGH="<highest note id the list above showed>"
+if [ -n "$PY" ]; then "$PY" "$NOTES" flush --through "$THROUGH"; fi
+```
+
+`status` and `list` separate three states, and the exit code is the point: `NO-STORE` (exit 2) —
+nothing captured **or** the path is wrong; `EMPTY` (exit 0) — captured and already routed;
+`PENDING n` (exit 0). Never read a zero as "quiet session" without the code that says which one
+it was. A quiet session needs no flush at all: on an absent store `flush` reports `NO-STORE` and
+exits 0. If notes you wrote are missing, stop and check the path before writing anything else.
+
+Store path, note schema, parallel writers, compaction recovery, and the reasoning behind each
+rule: `references/session-notes.md`. Load it on first setup, on any unexpected command output,
+or after a compaction.
+
 ## How to run
 
-1. **Reflect.** Three kinds of signal: a **reusable workflow** you would repeat across sessions;
-   an **error → recovery** that revealed a durable setup gotcha or approach correction; a **user
-   correction** of your approach, preference, or style.
+1. **Reflect.** Start from the `list` block above — the notes are the record, not your recall
+   of them — then add anything the session produced since the last capture. Three kinds of
+   signal: a **reusable workflow** you would repeat across sessions; an **error → recovery**
+   that revealed a durable setup gotcha or approach correction; a **user correction** of your
+   approach, preference, or style.
 
 2. **Gate.** Capture only if all three hold — **reusable** across sessions, **objectively
    checked** this session (test / exit 0 / verifier), and **not a no-op** (it changes behavior
@@ -44,12 +106,25 @@ Not for cross-project audits, unused-skill cleanup, or building a named asset �
    | Setup/infra fix | `docs/<topic>.md` in the owning repo | one docs-index row |
    | Approach correction / preference | auto-memory (below), or `CLAUDE.md` / `AGENTS.md` only when the fact must be in context before anything asks | memory: recall-gated; instruction file: every turn — the highest bar |
    | Workflow misunderstanding | `skill-creator` improvement to that skill | the `description:` line |
+   | Lesson true of every asset of a kind | the owning cross-cutting doc — `docs/writing-for-agents.md` for agent-facing writing, `docs/conventions.md` for shell/commit rules | one doc, not one copy per skill |
+
+   **Check the target's siblings before routing to one of them.** This repo has families — the
+   `task-*` cycle skills, the `harness-*` skills, the `scripts/ci/check_*.py` checkers, the
+   hooks under `dev/hooks/`. Fast test: could the sentence survive having the asset's name
+   removed? If yes, widen the delta to every sibling it fits or say in one line why it does not;
+   if it fits them all, it is the cross-cutting row above, not a per-skill edit.
 
    Mechanism before sentence: a rule expressible as a check goes there first; prose is the
    fallback. Every proposal names in one line **the concrete failure this prevents** ("without
    this: X happens again") — for memory it lands in the body.
 
-4. Nothing clears the gate → say so in one line and stop. That is the normal outcome.
+4. Nothing clears the gate → say so in one line and stop, then flush the ids you just read so
+   the next retrospective does not re-litigate them. That is the normal outcome.
+
+**Deferring is a decision, not a neutral hold.** Before writing any "later", name which specific
+observation would change the decision and when it could realistically arrive; if you cannot,
+the evidence is either conclusive or more of it changes nothing — act now. Routing heavy work to
+`backlog.md` is not this pattern: the queue is a place a later session actually reads.
 
 **Writing the delta.** State the positive target ("quote the rule verbatim"), not the prohibition.
 For pointer-shaped text (a `MEMORY.md` hook, a docs-index row, a `description:`), front-load a
@@ -64,6 +139,10 @@ change → inline edit to `docs/*.md` / `AGENTS.md`, it rides into the commit. A
 new skill, a skill overhaul, a multi-file rewrite — goes to `backlog.md` as a follow-up. Under
 `--auto` do not pause for the per-write veto; the review and CI are the safety net, and a
 destructive memory prune is deferred to `backlog.md` rather than blocking.
+
+The cycle's call is itself a flush trigger: list the pending notes first, and flush through the
+highest id listed once they are routed, so the commit and the note store agree about what this
+session learned.
 
 ## Writing to auto-memory
 
@@ -120,7 +199,23 @@ repairs the index.
 
 ## Additional Resources
 
+- **`scripts/session_notes.py`** — the note store behind *Capture on the spot*: `add`
+  (`--from-json` keeps note text away from the shell; the four fields are mandatory and rejected
+  empty, over 2000 chars, or carrying any character `check_asset_hygiene.py` bans), `list`,
+  `status`, `flush --through N`. The path resolves from `git rev-parse --git-common-dir`, so one
+  repo has one store shared by every worktree — never a cwd-relative path, and `add` and `flush`
+  take a lock so a concurrent capture cannot be dropped. `--test` covers the schema, each banned
+  character family, the exit codes, the scoped flush, the lock, and the worktree case.
+- **`references/session-notes.md`** — store layout, flush-trigger reasoning, parallel writers,
+  compaction recovery, the sibling/cross-cutting rules in full, and the CC BY 4.0 attribution for
+  the methodology this capture layer adapts.
 - **`hooks/memory-guard/guard.py`** — the `PreToolUse(Write|Edit)` gate behind step 4: blocks a
   memory write carrying a secret pattern, a control/bidi/zero-width character, an over-cap body,
   or a bad `status:`; `--check-file <path|->` is the same policy as a CLI. Fails open on
   unparseable payloads. `--test` covers each family.
+
+---
+
+Immediate-capture methodology adapted from *Task Observer ("One Skill to Rule Them All")* by
+Eoghan Henn, rebelytics.com — CC BY 4.0. Scope of the adaptation and what was deliberately not
+carried over: `references/session-notes.md`.
