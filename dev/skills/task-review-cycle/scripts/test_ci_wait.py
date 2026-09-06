@@ -243,6 +243,48 @@ def main() -> int:
               result.get("passed") is False
               and result.get("reason") == "checks-never-registered", f"got {result}")
 
+        print("\n-- a push-only workflow does not make CI 'configured' for a PR --")
+        push_only = make_repo(tmp, "none", name="none_push_only")
+        (push_only / ".github" / "workflows").mkdir(parents=True)
+        (push_only / ".github" / "workflows" / "deploy.yml").write_text(
+            "on:\n  push:\n    branches: [main]\n", encoding="utf-8")
+        result = run(push_only, CI_WAIT_NO_CHECKS_GRACE_SECS=0, CI_WAIT_POLL_INTERVAL=1)
+        check("a workflow with no PR trigger still passes as no-CI",
+              result.get("passed") is True
+              and result.get("reason") == "no CI checks found", f"got {result}")
+
+        print("\n-- a non-YAML file in the workflows dir does not make CI 'configured' --")
+        keep_only = make_repo(tmp, "none", name="none_gitkeep")
+        (keep_only / ".github" / "workflows").mkdir(parents=True)
+        (keep_only / ".github" / "workflows" / ".gitkeep").write_text("", encoding="utf-8")
+        (keep_only / ".github" / "workflows" / "README.md").write_text(
+            "workflows run on pull_request\n", encoding="utf-8")
+        result = run(keep_only, CI_WAIT_NO_CHECKS_GRACE_SECS=0, CI_WAIT_POLL_INTERVAL=1)
+        check("a .gitkeep/README leftover still passes as no-CI",
+              result.get("passed") is True
+              and result.get("reason") == "no CI checks found", f"got {result}")
+
+        print("\n-- a symlinked workflow file counts as CI configured --")
+        linked = make_repo(tmp, "none", name="none_symlink")
+        (linked / ".github" / "workflows").mkdir(parents=True)
+        (linked / "shared-ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        (linked / ".github" / "workflows" / "ci.yml").symlink_to(linked / "shared-ci.yml")
+        result = run(linked, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=1, CI_WAIT_POLL_INTERVAL=1)
+        check("a symlinked workflow blocks the no-CI pass",
+              result.get("passed") is False
+              and result.get("reason") == "checks-never-registered", f"got {result}")
+
+        print("\n-- a zero configured-grace override falls back to the default --")
+        zero_grace = make_repo(tmp, "none", name="none_zero_grace")
+        (zero_grace / ".github" / "workflows").mkdir(parents=True)
+        (zero_grace / ".github" / "workflows" / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        result = run(zero_grace, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=0, CI_WAIT_TIMEOUT_SECS=1,
+                     CI_WAIT_POLL_INTERVAL=1)
+        check("a zero grace does not report checks-never-registered on the first poll",
+              result.get("passed") is False and result.get("reason") == "timeout", f"got {result}")
+
         print("\n-- an empty workflow directory is not CI configured --")
         empty_dir = make_repo(tmp, "none", name="none_empty_workflows")
         (empty_dir / ".github" / "workflows").mkdir(parents=True)

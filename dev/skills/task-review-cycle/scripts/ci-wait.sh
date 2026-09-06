@@ -87,11 +87,23 @@ case "$NO_CHECKS_GRACE_SECS" in ''|*[!0-9]*) NO_CHECKS_GRACE_SECS=90 ;; esac
 # reason to resolve.
 CONFIGURED_GRACE_SECS="${CI_WAIT_CONFIGURED_GRACE_SECS:-300}"
 case "$CONFIGURED_GRACE_SECS" in ''|*[!0-9]*) CONFIGURED_GRACE_SECS=300 ;; esac
+# The numeric guard accepts 0, which would report checks-never-registered on the very first poll
+# — no grace at all. Floor it, the same way POLL_INTERVAL is floored above.
+if [ "$CONFIGURED_GRACE_SECS" -lt 1 ]; then
+  CONFIGURED_GRACE_SECS=300
+fi
 
-# Is CI configured for this repo at all? Probed from the checked-out tree rather than the hub
-# API: no network, no auth, and it works for both backends hub.sh supports. A CI that reports
-# only through the status API (Jenkins, drone) is not visible here and falls back to the
-# pre-existing no-CI pass — no worse than before. Memoized: the answer cannot change mid-wait.
+# Is CI configured *for a pull request* in this repo? Probed from the checked-out tree rather
+# than the hub API: no network, no auth, and it works for both backends hub.sh supports. A CI
+# that reports only through the status API (Jenkins, drone) is not visible here and falls back
+# to the pre-existing no-CI pass — no worse than before. Memoized: the answer cannot change
+# mid-wait.
+#
+# The `pull_request` requirement is what keeps the probe honest: a repo whose only workflow is
+# push- or schedule-triggered registers no PR check by design, and treating that as "CI is
+# coming" would burn the configured grace and then demand a human on every single PR. A stray
+# mention of pull_request in an `if:` expression false-positives, which errs toward waiting —
+# the safe direction.
 CI_CONFIGURED=""
 ci_configured() {
   if [ -z "$CI_CONFIGURED" ]; then
@@ -99,13 +111,18 @@ ci_configured() {
     top=$(git rev-parse --show-toplevel 2>/dev/null || true)
     CI_CONFIGURED=no
     if [ -n "$top" ]; then
-      local dir
+      local dir file
       for dir in "$top/.github/workflows" "$top/.forgejo/workflows" "$top/.gitea/workflows"; do
-        # An empty workflows directory configures nothing; require a file inside it.
-        if [ -d "$dir" ] && [ -n "$(find "$dir" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]; then
-          CI_CONFIGURED=yes
-          break
-        fi
+        [ -d "$dir" ] || continue
+        # -type f would drop a symlinked workflow; a plain -name glob would pick up a .gitkeep
+        # or a README. Match YAML by name, follow symlinks, and require a PR trigger.
+        while IFS= read -r file; do
+          if grep -qE '(^|[^A-Za-z_-])pull_request' "$file" 2>/dev/null; then
+            CI_CONFIGURED=yes
+            break
+          fi
+        done < <(find -L "$dir" -maxdepth 1 \( -name '*.yml' -o -name '*.yaml' \) -type f 2>/dev/null)
+        [ "$CI_CONFIGURED" = yes ] && break
       done
     fi
   fi
