@@ -28,7 +28,10 @@ Usage:
   prune-backlog   Delete the verbatim `- [ ]` lines given on stdin, then delete any heading
                   this run left with an entirely blank region, or with nothing left but its own
                   intro prose. Refuses (exit 1) on a line that matches nothing, rather than
-                  deleting an approximation of it.
+                  deleting an approximation of it. Then warns on stderr (exit stays 0) when a
+                  surviving `*(blocked by: …)*` marker still names something this run deleted —
+                  nothing else would ever clear it, and the marked item is invisible to
+                  candidate selection until someone does.
 
   prune-tasks     Same deletion pass, plus `--block TITLE` to delete a whole h1 sprint block.
                   Deletes the file when nothing but blank lines is left — safe only because
@@ -66,9 +69,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backlog_candidates import (  # noqa: E402
+    _BLOCK_MARKER_RE,
+    _BULLET_RE,
+    _CHECKBOX_RE,
+    _HEADING_RE,
+    _STATUS_RE,
     _headings,
+    _is_placeholder_payload,
     _strip_fenced_blocks,
     _strip_html_comments,
+    backlog_fast_candidates,
     tasks_persistent_sections,
     tokenize,
 )
@@ -527,6 +537,216 @@ def prune_lines(text: str, targets: list[str]) -> tuple[str, list[str]]:
     return (out if out.strip() else ""), []
 
 
+# ---------------------------------------------------------------------------
+# orphaned blockers (prune-backlog only)
+# ---------------------------------------------------------------------------
+
+# `slugify` truncates at a word boundary for branch names; slug MATCHING wants the whole thing,
+# since the identifying word can sit past the branch-name budget.
+_SLUG_UNTRUNCATED = 10 ** 6
+
+
+def _slug_tokens(text: str) -> list[str]:
+    """Untruncated kebab tokens of `text` — the unit blocker slugs are matched in."""
+    return [t for t in slugify(text, max_len=_SLUG_UNTRUNCATED).split("-") if t]
+
+
+def _blocker_tokens(payload: str) -> list[str]:
+    """Tokens of a `*(blocked by: <n>-<slug>)*` payload, minus the batch-position `<n>` prefix.
+
+    `<n>` is frozen when the ticket batch is written and is never renumbered (`dev:task-tickets`
+    SKILL.md), so it identifies nothing — the slug is the identifying half. A payload that is
+    nothing but a number is unresolvable by design and yields no tokens, so it matches nothing
+    rather than matching everything.
+    """
+    tokens = _slug_tokens(payload)
+    if tokens and tokens[0].isdigit():
+        tokens = tokens[1:]
+    return [] if all(t.isdigit() for t in tokens) else tokens
+
+
+def _contains_tokens(haystack: list[str], needle: list[str]) -> bool:
+    """True if every `needle` token appears in `haystack`, in order, as a whole token.
+
+    Whole tokens, not a substring: `auth` must not match `authors`. In order but NOT contiguous,
+    because a marker's slug is the item's abbreviated short name while a subject is the full
+    slugified title, stopwords and all: PR #258's own case is the payload
+    `skill-run-sink-cross-process-append-lock` against the heading
+    `harness-skill-run-sink-has-no-cross-process-append-lock` — a subsequence, never a run. A
+    contiguous test passes hand-written fixtures and misses every real marker.
+    """
+    if not needle or len(needle) > len(haystack):
+        return False
+    it = iter(haystack)
+    return all(any(h == t for h in it) for t in needle)
+
+
+def _contains_run(haystack: list[str], needle: list[str]) -> bool:
+    """True if `needle` appears in `haystack` as a CONTIGUOUS run of whole tokens.
+
+    The strict half of the pair. `_contains_tokens` decides whether a marker *names* something this
+    run deleted, where a loose match only risks an extra advisory line; this decides whether a
+    surviving item *is* the live blocker, where a loose match silences the warning entirely. A
+    marker's payload is an item's short name, so it sits contiguously in that item's slug — an
+    unrelated item whose prose merely scatters the same words in order is not the blocker.
+    """
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[i:i + len(needle)] == needle
+        for i in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def _line_owners(text: str) -> tuple[dict[int, int], dict[int, str]]:
+    """`({line index: owning checkbox line}, {checkbox line: state char})`, 0-based.
+
+    A wrapped item's continuation lines belong to the checkbox that opened it, so a marker on a
+    continuation line resolves to the same item as one written inline. Without this the owner test
+    below compares a continuation index against a checkbox index, never matches, and the item
+    suppresses its own warning.
+
+    The folding rules are `tokenize`'s, deliberately re-walked rather than approximated: a heading,
+    a `status:` line, a nested bullet, a checkbox or a blank line ends an item, and only an
+    indented non-blank line continues one, with the indent read from the RAW line so a nested fence
+    does not close the item. A marker the walk leaves unowned — a nested sub-bullet's, say — is not
+    an item's blocker, and the caller reports nothing for it. Approximating this is how a warning
+    ends up claiming an item is unselectable while `backlog_candidates` still offers it.
+    """
+    owner: dict[int, int] = {}
+    state: dict[int, str] = {}
+    raw_lines = text.splitlines()
+    masked = _strip_fenced_blocks(_strip_html_comments(text)).splitlines()
+    current: int | None = None
+    for i, line in enumerate(masked):
+        if _HEADING_RE.match(line) or _STATUS_RE.match(line):
+            current = None
+            continue
+        m = _CHECKBOX_RE.match(line)
+        if m:
+            current = i
+            state[i] = m.group(1)
+            owner[i] = i
+            continue
+        if _BULLET_RE.match(line):
+            current = None
+            continue
+        if current is None:
+            continue
+        raw = raw_lines[i] if i < len(raw_lines) else ""
+        if raw[:1].isspace() and raw.strip():
+            owner[i] = current
+        else:
+            current = None
+    return owner, state
+
+
+def orphaned_blockers(original: str, removed: list[str], new_text: str, label: str) -> list[str]:
+    """Warning lines for surviving `*(blocked by: …)*` markers naming something this run deleted.
+
+    An item whose blocker marker outlives its blocker is filtered out of candidate selection by
+    `backlog_candidates.py` forever: the blocker will never land again, so nothing prompts anyone
+    to clear the marker. Detection is advisory — the caller warns and still writes the file, since
+    a marker's wording is a judgment call and rewriting it here would be guessing.
+
+    Subjects are the item lines this run deleted plus the headings it drained away (a marker often
+    names the section, not the item). A marker is reported only when all of these hold:
+
+      - it is `blocked by`, not `deferred` — a deferral names a reason, not an item;
+      - its payload names something resolvable — a payload that is nothing but `<placeholders>` is
+        prose quoting the syntax, while one that merely embeds a `<v2>` still names a real blocker;
+      - it sits on an OPEN `- [ ]` item: a `[x]`/`[>]` item was never a candidate and a nested
+        sub-bullet is not an item, so a warning there would contradict the selector;
+      - it survives outside a fence or an HTML comment, per the masked view the pruner already
+        trusts for deletion — a marker inside a sample is markup;
+      - no *other* surviving OPEN item still answers to the same slug, which would mean the
+        blocker is alive and this marker is fine. A `[x]`/`[>]` item is not a live blocker — a
+        landed blocker is precisely the marker that needs clearing — and neither is a fellow
+        blockee carrying the same marker, or two items waiting on one pruned blocker would
+        silence each other and both stay unselectable.
+    """
+    subjects: list[tuple[str, list[str]]] = []
+    for raw in removed:
+        m = _CHECKBOX_LINE_RE.match(raw)
+        body = m.group(1) if m else raw
+        tokens = _slug_tokens(body)
+        if tokens:
+            subjects.append((slugify(body), tokens))
+    surviving_titles = [h["title"] for h in _headings(tokenize(new_text))]
+    for title in (h["title"] for h in _headings(tokenize(original))):
+        if title in surviving_titles:
+            surviving_titles.remove(title)  # consume one, so a duplicated title is not double-counted
+            continue
+        tokens = _slug_tokens(title)
+        if tokens:
+            subjects.append((slugify(title), tokens))
+    if not subjects:
+        return []
+
+    lines = new_text.splitlines()
+    masked = _strip_fenced_blocks(_strip_html_comments(new_text)).splitlines()
+    if len(masked) != len(lines):  # same fail-safe as `prune_lines`: warn about nothing, not wrongly
+        return []
+    owner, state = _line_owners(new_text)
+    # Per surviving item: its own text minus its own markers (an item is never the blocker it
+    # waits on), and the blocker slugs it is itself waiting on.
+    bodies: dict[int, list[str]] = {}
+    waiting: dict[int, list[list[str]]] = {}
+    for i, ln in enumerate(masked):
+        item = owner.get(i)
+        if item is None:
+            continue
+        bodies.setdefault(item, []).append(_BLOCK_MARKER_RE.sub(" ", ln))
+        for marker in _BLOCK_MARKER_RE.finditer(ln):
+            if marker.group(1).lower() == "blocked by":
+                waiting.setdefault(item, []).append(_blocker_tokens(marker.group(2)))
+    survivors = {
+        item: _slug_tokens(" ".join(parts))
+        for item, parts in bodies.items()
+        if state.get(item) == " "
+    }
+
+    findings: dict[str, list[str]] = {}
+    for i, ln in enumerate(masked):
+        for marker in _BLOCK_MARKER_RE.finditer(ln):
+            if marker.group(1).lower() != "blocked by":
+                continue
+            if _is_placeholder_payload(marker.group(2)):
+                continue
+            tokens = _blocker_tokens(marker.group(2))
+            if not tokens:
+                continue
+            hit = next((s for s in subjects if _contains_tokens(s[1], tokens)), None)
+            if hit is None:
+                continue
+            this_item = owner.get(i)
+            # A marker not owned by an OPEN item blocks nothing: a `[x]`/`[>]` item was never a
+            # candidate, and a nested sub-bullet is not an item at all. Reporting either would
+            # claim an item is unselectable when `backlog_candidates` still offers it.
+            if this_item is None or state.get(this_item) != " ":
+                continue
+            if any(
+                _contains_run(toks, tokens)
+                for j, toks in survivors.items()
+                if j != this_item and tokens not in waiting.get(j, [])
+            ):
+                continue
+            hits = findings.setdefault(hit[0], [])
+            entry = f"  {label}:{i + 1}: {lines[i].strip()}"
+            if entry not in hits:
+                hits.append(entry)
+
+    out: list[str] = []
+    for slug, hits in findings.items():
+        out.append(
+            f"Warning: pruned item `{slug}` is still named as a blocker by {len(hits)} surviving "
+            "line(s). Nothing will clear the marker now that the blocker is gone, so those items "
+            "stay invisible to candidate selection until you delete it by hand:"
+        )
+        out.extend(hits)
+    return out
+
+
 def persistent_sections(text: str) -> list[str]:
     """Titles of findings sections that must not be in `tasks.md`.
 
@@ -671,6 +891,7 @@ def cmd_prune(argv: list[str], *, delete_if_empty: bool) -> int:
             )
             return 1
     block = _opt(argv, "--block")
+    targets: list[str] = []
     if block is not None:
         new_text, problems = prune_h1_block(text, block)
     else:
@@ -685,6 +906,12 @@ def cmd_prune(argv: list[str], *, delete_if_empty: bool) -> int:
         sys.stderr.write("Nothing was deleted — fix the input and re-run.\n")
         return 1
     print(_write_or_delete(path, new_text, delete_if_empty))
+    # Advisory only, and emitted after the write: the deletion itself was correct, and the run must
+    # not fail over a marker whose rewording is the caller's judgment call. `tasks.md` is deleted
+    # whole at sprint close and holds no queue markers, so this is the backlog pruner's concern.
+    if targets and not delete_if_empty:
+        for line in orphaned_blockers(text, targets, new_text, str(path)):
+            sys.stderr.write(f"{line}\n")
     return 0
 
 
@@ -1161,6 +1388,246 @@ Preamble with no h1 wrapper.
     out, _ = prune_lines(no_final_newline, ["- [ ] x"])
     _assert(out == "## A\n\n- [ ] y\n",
             "a file with no trailing newline gains one from the dominant ending, losing no content")
+
+    # ---- orphaned blockers ----
+    print("\nTest 3c: prune-backlog — surviving `*(blocked by: …)*` markers naming a pruned item")
+    orphan_src = """## Sink lock
+
+- [ ] [FEAT] Make the skill-run sink lock durable
+- [ ] [HARNESS] Report lock contention *(blocked by: 3-sink-lock)*
+"""
+    done = "- [ ] [FEAT] Make the skill-run sink lock durable"
+    pruned, problems = prune_lines(orphan_src, [done])
+    _assert(problems == [], "the orphan fixture prunes cleanly (guards the fixture, not the feature)")
+    warnings = orphaned_blockers(orphan_src, [done], pruned, "backlog.md")
+    _assert(
+        len(warnings) == 2
+        and warnings[0].startswith("Warning: pruned item `make-the-skill-run-sink-lock-durable`")
+        and warnings[1] == "  backlog.md:3: - [ ] [HARNESS] Report lock contention *(blocked by: 3-sink-lock)*",
+        "a marker naming the pruned item is reported with the item's slug and the surviving line",
+    )
+    _assert(
+        orphaned_blockers(orphan_src, [done], pruned, "backlog.md")
+        == orphaned_blockers(orphan_src, [done], pruned, "backlog.md"),
+        "detection is deterministic — same input, same warning lines",
+    )
+
+    # The blocker is named by the HEADING the run drained away, not by the item's own wording.
+    heading_src = """# Backlog
+
+## Sink lock
+
+- [ ] [FEAT] Make it durable
+
+## Follow-ups
+
+- [ ] [HARNESS] Report contention *(blocked by: sink-lock)*
+"""
+    only_item = "- [ ] [FEAT] Make it durable"
+    pruned_heading, _ = prune_lines(heading_src, [only_item])
+    _assert(
+        any("`sink-lock`" in w for w in orphaned_blockers(heading_src, [only_item], pruned_heading, "b.md")),
+        "a marker naming a heading this run emptied away is orphaned too, not only an item slug",
+    )
+
+    # Negative cases — each must stay silent.
+    placeholder_src = """## Docs
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [HARNESS] Document the `*(blocked by: <slug>)*` marker format
+"""
+    ph_done = "- [ ] [FEAT] Make the sink lock durable"
+    ph_pruned, _ = prune_lines(placeholder_src, [ph_done])
+    _assert(
+        orphaned_blockers(placeholder_src, [ph_done], ph_pruned, "backlog.md") == [],
+        "a placeholder marker in prose is a syntax example, never an orphaned blocker",
+    )
+
+    fenced_src = """## Docs
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [HARNESS] Explain the syntax
+
+```markdown
+- [ ] [FEAT] later work *(blocked by: 3-sink-lock)*
+```
+"""
+    f_pruned, _ = prune_lines(fenced_src, [ph_done])
+    _assert(
+        orphaned_blockers(fenced_src, [ph_done], f_pruned, "backlog.md") == [],
+        "a marker inside a fenced sample is markup — the same masked view the pruner deletes by",
+    )
+
+    alive_src = """## Group
+
+- [ ] [FEAT] Add sink lock telemetry
+- [ ] [FEAT] Add sink lock telemetry dashboards
+- [ ] [HARNESS] Report contention *(blocked by: sink-lock-telemetry)*
+"""
+    a_done = "- [ ] [FEAT] Add sink lock telemetry"
+    a_pruned, _ = prune_lines(alive_src, [a_done])
+    _assert(
+        orphaned_blockers(alive_src, [a_done], a_pruned, "backlog.md") == [],
+        "a surviving open item still answering to the slug means the blocker is alive, not orphaned",
+    )
+
+    deferred_src = """## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [HARNESS] Report contention *(deferred: sink lock ops values missing)*
+"""
+    d_pruned, _ = prune_lines(deferred_src, [ph_done])
+    _assert(
+        orphaned_blockers(deferred_src, [ph_done], d_pruned, "backlog.md") == [],
+        "a *(deferred: …)* marker names a reason, not an item, so it is never orphaned",
+    )
+
+    numeric_src = """## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [HARNESS] Report contention *(blocked by: 3)*
+"""
+    n_pruned, _ = prune_lines(numeric_src, [ph_done])
+    _assert(
+        orphaned_blockers(numeric_src, [ph_done], n_pruned, "backlog.md") == [],
+        "a number-only payload identifies nothing and must match nothing, not everything",
+    )
+    # REGRESSION (PR #269 review): the real PR #258 shape — an abbreviated marker slug against a
+    # slugified heading full of stopwords is an order-preserving subsequence, never a contiguous
+    # run. A contiguous test passed every fixture above and missed the only case that mattered.
+    real_src = """# Backlog
+
+## Sink lock
+
+- [ ] [HARNESS] skill-run sink has no cross-process append lock
+
+## Follow-ups
+
+- [ ] [HARNESS] Report contention *(blocked by: skill-run-sink-cross-process-append-lock)*
+"""
+    real_done = "- [ ] [HARNESS] skill-run sink has no cross-process append lock"
+    real_pruned, _ = prune_lines(real_src, [real_done])
+    _assert(
+        any("cross-process-append-lock" in w for w in
+            orphaned_blockers(real_src, [real_done], real_pruned, "backlog.md")),
+        "REGRESSION: an abbreviated marker slug matches its subject as a subsequence, not a run",
+    )
+
+    # REGRESSION (PR #269 review): two items waiting on one pruned blocker are fellow blockees, not
+    # each other's blocker. Counting them as live silenced both and left both unselectable.
+    siblings_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [FEAT] Sink lock telemetry *(blocked by: sink-lock)*
+- [ ] [FEAT] Sink lock dashboards *(blocked by: sink-lock)*
+"""
+    sib_done = "- [ ] [FEAT] Make the sink lock durable"
+    sib_pruned, _ = prune_lines(siblings_src, [sib_done])
+    sib_out = orphaned_blockers(siblings_src, [sib_done], sib_pruned, "backlog.md")
+    _assert(
+        len(sib_out) == 3 and sum(1 for w in sib_out if w.startswith("  ")) == 2,
+        "REGRESSION: sibling blockees do not suppress each other — both orphaned lines are reported",
+    )
+
+    # REGRESSION (PR #269 review): a marker on a continuation line belongs to its own item, so the
+    # owner test must resolve it back to the checkbox line or the item silences itself.
+    wrapped_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [FEAT] Report contention, a long item whose marker wrapped
+      onto the next line *(blocked by: sink-lock)*
+"""
+    wrapped_pruned, _ = prune_lines(wrapped_src, [sib_done])
+    _assert(
+        any(w.startswith("  ") for w in
+            orphaned_blockers(wrapped_src, [sib_done], wrapped_pruned, "backlog.md")),
+        "REGRESSION: a marker on a continuation line still reports — the item is not its own blocker",
+    )
+
+    # REGRESSION (PR #269 review): a landed `[x]` blocker is exactly the marker that needs clearing.
+    closed_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [x] [FEAT] Make the sink lock durable again
+- [ ] [FEAT] Report contention *(blocked by: sink-lock)*
+"""
+    closed_pruned, _ = prune_lines(closed_src, [sib_done])
+    _assert(
+        any(w.startswith("  ") for w in
+            orphaned_blockers(closed_src, [sib_done], closed_pruned, "backlog.md")),
+        "REGRESSION: a closed [x] item is not a live blocker, so it cannot suppress the warning",
+    )
+
+    # REGRESSION (PR #269 re-review): the loose subject match must NOT loosen the suppression path.
+    # An unrelated open item whose prose scatters the blocker's words in order is not the blocker,
+    # and treating it as one silenced the warning on PR #258's own shape.
+    prose_src = """# Backlog
+
+## Sink lock
+
+- [ ] [HARNESS] skill-run sink has no cross-process append lock
+
+## Follow-ups
+
+- [ ] [HARNESS] Report contention *(blocked by: skill-run-sink-cross-process-append-lock)*
+- [ ] [FEAT] Unrelated work mentioning the skill run sink and its cross process append lock behaviour
+"""
+    prose_done = "- [ ] [HARNESS] skill-run sink has no cross-process append lock"
+    prose_pruned, _ = prune_lines(prose_src, [prose_done])
+    _assert(
+        sum(1 for w in orphaned_blockers(prose_src, [prose_done], prose_pruned, "b.md")
+            if w.startswith("  ")) == 1,
+        "REGRESSION: an unrelated item's prose does not count as the live blocker",
+    )
+    _assert(
+        _contains_run(["add", "sink", "lock", "telemetry"], ["sink", "lock"]) is True
+        and _contains_run(["sink", "and", "lock"], ["sink", "lock"]) is False
+        and _contains_tokens(["sink", "and", "lock"], ["sink", "lock"]) is True,
+        "the two matchers differ exactly as documented: run is strict, subsequence is loose",
+    )
+
+    # REGRESSION (PR #269 re-review): only an OPEN item's marker is worth reporting. A `[x]`/`[>]`
+    # item was never a candidate, and a nested sub-bullet is not an item — `backlog_candidates`
+    # still offers the enclosing heading, so a warning there would be false.
+    closed_owner_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [x] [FEAT] Telemetry *(blocked by: make-the-sink-lock-durable)*
+"""
+    co_pruned, _ = prune_lines(closed_owner_src, [sib_done])
+    _assert(
+        orphaned_blockers(closed_owner_src, [sib_done], co_pruned, "b.md") == [],
+        "REGRESSION: a marker on a closed [x] item is not reported — it blocks nothing",
+    )
+    nested_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [FEAT] Telemetry
+  - sub note *(blocked by: make-the-sink-lock-durable)*
+"""
+    nested_pruned, _ = prune_lines(nested_src, [sib_done])
+    _assert(
+        orphaned_blockers(nested_src, [sib_done], nested_pruned, "b.md") == []
+        and [c["title"] for c in backlog_fast_candidates(tokenize(nested_pruned))] == ["Group"],
+        "REGRESSION: a nested bullet's marker is not an item's blocker, and the item stays a candidate",
+    )
+
+    _assert(
+        orphaned_blockers("", [], "", "backlog.md") == []
+        and orphaned_blockers(orphan_src, [], pruned, "backlog.md") == []
+        and orphaned_blockers(orphan_src, [done], "```\n", "backlog.md") == [],
+        "empty and malformed input yield no warnings rather than a crash or a false report",
+    )
 
     # ---- prune-tasks h1 block ----
     print("\nTest 4: prune-tasks — h1 sprint blocks")

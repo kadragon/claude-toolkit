@@ -104,6 +104,12 @@ A heading is dropped only where this cycle emptied it. `changelog` validates the
 repo's `scripts/ci/check_changelog_entries.py` (one line, ≤160 chars, at most one `→` link, no
 explanatory clauses).
 
+`prune-backlog` exits 0 but warns on stderr when a surviving `*(blocked by: …)*` marker still names
+an item or heading it just deleted — this cycle *was* the blocker. Act on that warning: delete the
+named marker before you hand off, or the marked item is invisible to candidate selection with
+nothing left to clear it. The warning is advisory because the marker's rewording is a judgment
+call, so an unread one is a silently unselectable item.
+
 **Blocked-marker sync** (queue items only, scoped to items inspected this run): an item you
 verified is blocked and carries no marker → append `*(blocked by: <slug>)*` or `*(deferred:
 <reason>)*`. A marker whose blocker you can see has landed (`[x]`, or removed in git) → delete
