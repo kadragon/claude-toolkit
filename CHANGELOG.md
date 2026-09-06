@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- [done] ci-wait refuses to pass when a configured CI's checks have not registered (dev v4.9.4) (2026-09-06)
 - [done] harness-capture captures observations on the spot into a repo-local note store (dev v4.9.3) (2026-09-06)
 - [done] spawn briefs stop asking role-file agents for SendMessage; result-handoff rule owned by delegation doc (dev v4.9.2) (2026-09-05) → docs/delegation.md
 - [done] late review source persists its result for a pre-merge reclaim (dev v4.9.1) (2026-09-05)

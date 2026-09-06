@@ -78,6 +78,40 @@ fi
 # concluding "no CI configured" and passing.
 NO_CHECKS_GRACE_SECS="${CI_WAIT_NO_CHECKS_GRACE_SECS:-90}"
 case "$NO_CHECKS_GRACE_SECS" in ''|*[!0-9]*) NO_CHECKS_GRACE_SECS=90 ;; esac
+# ...but where the repo *does* configure CI, "no checks" is not an answer, it is a check set
+# that has not registered yet — a busy runner queue outlasts the grace above, and passing on it
+# merges before CI exists (PR #266: 14 checks started right after a "no CI checks found" pass).
+# Wait this much longer, then report a distinct non-passing reason instead of guessing. Capped
+# well under TIMEOUT_SECS because a workflow whose `paths:` filter excludes this PR legitimately
+# registers nothing, and burning the whole budget on it is worse than handing the caller a
+# reason to resolve.
+CONFIGURED_GRACE_SECS="${CI_WAIT_CONFIGURED_GRACE_SECS:-300}"
+case "$CONFIGURED_GRACE_SECS" in ''|*[!0-9]*) CONFIGURED_GRACE_SECS=300 ;; esac
+
+# Is CI configured for this repo at all? Probed from the checked-out tree rather than the hub
+# API: no network, no auth, and it works for both backends hub.sh supports. A CI that reports
+# only through the status API (Jenkins, drone) is not visible here and falls back to the
+# pre-existing no-CI pass — no worse than before. Memoized: the answer cannot change mid-wait.
+CI_CONFIGURED=""
+ci_configured() {
+  if [ -z "$CI_CONFIGURED" ]; then
+    local top
+    top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    CI_CONFIGURED=no
+    if [ -n "$top" ]; then
+      local dir
+      for dir in "$top/.github/workflows" "$top/.forgejo/workflows" "$top/.gitea/workflows"; do
+        # An empty workflows directory configures nothing; require a file inside it.
+        if [ -d "$dir" ] && [ -n "$(find "$dir" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]; then
+          CI_CONFIGURED=yes
+          break
+        fi
+      done
+    fi
+  fi
+  [ "$CI_CONFIGURED" = yes ]
+}
+
 START=$(date +%s)
 DEADLINE=$(( START + TIMEOUT_SECS ))
 
@@ -105,7 +139,14 @@ while true; do
       exit 0
       ;;
     none)
-      if [ $(( NOW - START )) -ge "$NO_CHECKS_GRACE_SECS" ]; then
+      if ci_configured; then
+        # Never a pass. Like `timeout`, this is not rework: leave the strike counter alone.
+        if [ $(( NOW - START )) -ge "$CONFIGURED_GRACE_SECS" ]; then
+          jq -n --arg pr "$PR_NUMBER" \
+            '{passed: false, reason: "checks-never-registered", pr_number: $pr}'
+          exit 0
+        fi
+      elif [ $(( NOW - START )) -ge "$NO_CHECKS_GRACE_SECS" ]; then
         clear_strikes  # a pass is a pass: no-CI must reset the counter like `success` does
         jq -n '{passed: true, reason: "no CI checks found"}'
         exit 0
