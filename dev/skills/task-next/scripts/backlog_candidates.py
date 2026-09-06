@@ -124,11 +124,18 @@ _CHECKBOX_RE = re.compile(r"^-\s*\[([ xX>])\]\s*(.*)$")
 # `_is_blocked` inspects the payload; `task_nodes.orphaned_blockers` selects `blocked by` markers by
 # the keyword and resolves their payload against the items a prune run deleted.
 _BLOCK_MARKER_RE = re.compile(r"\*\(\s*(deferred|blocked by)\s*:(.*?)\)\*", re.IGNORECASE)
-# A payload naming an angle-bracket placeholder (`<slug>`, `<n>-<slug>`, `<reason>`) is a
-# documentation example of the syntax, not a blocker anyone can resolve. Real markers name a
-# concrete kebab slug or reason and never contain `<`/`>`; an item describing the marker format in
-# its own prose would otherwise park itself forever, with no blocker to clear.
+# `<slug>`, `<n>-<slug>` — a payload that is NOTHING BUT angle-bracket placeholders and separators
+# is a documentation example of the syntax, not a blocker anyone can resolve; an item describing
+# the marker format in its own prose would otherwise park itself forever, with no blocker to
+# clear. A payload that merely embeds a placeholder (`3-migrate-to-<v2>-api`) still names a real
+# blocker and must stay parked, so the test is "no alphanumeric survives stripping the
+# placeholders", not "contains a placeholder".
 _MARKER_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
+
+
+def _is_placeholder_payload(payload: str) -> bool:
+    """True if `payload` names no resolvable blocker — only `<placeholders>` and separators."""
+    return not any(c.isalnum() for c in _MARKER_PLACEHOLDER_RE.sub(" ", payload))
 # HTML comments hold format templates (`## Feature Name` / `- [ ] Simplest case`) that must
 # never surface as candidates.
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -168,8 +175,8 @@ SPRINT_SECTION_TITLES = frozenset(
 def _is_blocked(text: str) -> bool:
     """True if `text` (the checkbox item body) carries a *resolvable* deferred/blocked-by marker.
 
-    A `blocked by` marker whose payload holds an angle-bracket placeholder is prose quoting the
-    syntax — an item about the marker format, or a template — so it parks nothing. Without this, an
+    A `blocked by` marker whose payload is nothing but angle-bracket placeholders is prose quoting
+    the syntax — an item about the marker format, or a template — so it parks nothing. Without this, an
     item that merely documents `*(blocked by: <slug>)*` is filtered out of candidate selection
     permanently, because there is no blocker to land and no marker anyone would think to clear.
 
@@ -178,7 +185,7 @@ def _is_blocked(text: str) -> bool:
     item somebody deliberately deferred, which is the opposite failure.
     """
     return any(
-        not (m.group(1).lower() == "blocked by" and _MARKER_PLACEHOLDER_RE.search(m.group(2)))
+        not (m.group(1).lower() == "blocked by" and _is_placeholder_payload(m.group(2)))
         for m in _BLOCK_MARKER_RE.finditer(text)
     )
 
@@ -933,6 +940,11 @@ status: open
     _assert(
         _is_blocked("item *(blocked by: <slug>)* *(blocked by: 3-add-auth)*") is True,
         "one real marker still parks an item that also quotes a placeholder one",
+    )
+    _assert(
+        _is_blocked("item *(blocked by: 3-migrate-to-<v2>-api)*") is True,
+        "REGRESSION: a real slug that merely embeds a placeholder still parks the item — the "
+        "exemption is for a payload that is nothing BUT placeholders",
     )
     _assert(
         _is_blocked("item *(deferred: waiting on <team> reply)*") is True,
