@@ -356,3 +356,27 @@ different pair — one the spec never designated a deliberate neighbor — over 
 churn (a 14th skill appearing, an existing one removed) moves the same figures by far less.
 So a pointer edit is followed by a re-measure of the whole distribution, exactly as this slice
 did, never by a lowered τ.
+
+### Measured 2026-09-06 — `harness-capture`'s description is length-pinned, in both directions
+
+Adding the session note store to `dev:harness-capture` came with a proposed description edit
+naming the new capture step. Both a longer and a shorter description fail Half A, against
+*different* neighbours:
+
+| Description | Result |
+|-------------|--------|
+| Unchanged (shipped) | all scorable queries pass |
+| +1 clause (longer) | `task-review` negative *"review the current diff for correctness bugs and simplification cleanups"* ranks `task-review` 1st (0.2069) |
+| Reworded shorter | `task-review` positive *"start the review cycle with --auto so it skips the confirmation"* ranks `harness-capture` 1st (0.2730; 0.3040 on a second variant) |
+
+The mechanism: `harness-capture`'s description carries both `CURRENT` and `review`, so after L2
+normalization its weight on that vocabulary is a direct function of the description's length.
+Lengthening dilutes it until `task-review` wins a query neither skill should own — the built-in
+`code-review` skill is outside this corpus, which is why that negative has no correct winner
+inside it. Shortening concentrates it until `harness-capture` outranks `task-review` on
+`task-review`'s own positives.
+
+**The rule this establishes: a description's *length* is a tuned parameter, not free space.**
+Measure both directions before editing one — an edit that looks purely additive can fail through
+normalization alone, without introducing a single colliding token. The change that prompted this
+shipped with the description untouched and put the new behavior in the skill body instead.
