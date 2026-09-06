@@ -80,7 +80,8 @@ from backlog_candidates import (  # noqa: E402
 
 # `[FEAT]`, `[HARNESS]`, … as written at the head of a checkbox item's text.
 _TAG_RE = re.compile(r"\[([A-Z][A-Z_-]*)\]")
-_CHECKBOX_LINE_RE = re.compile(r"^\s*-\s*\[[ xX>]\]\s*(.*)$")
+# Group 1 is the state character, group 2 the item body.
+_CHECKBOX_LINE_RE = re.compile(r"^\s*-\s*\[([ xX>])\]\s*(.*)$")
 DEFAULT_MAX_SLUG = 48
 FALLBACK_TAG = "fix"
 
@@ -115,7 +116,7 @@ def derive_tag(item_lines: list[str]) -> tuple[str, str | None]:
     tags = []
     for raw in item_lines:
         m = _CHECKBOX_LINE_RE.match(raw)
-        body = m.group(1) if m else raw
+        body = m.group(2) if m else raw
         found = _TAG_RE.match(body.strip())
         if found:
             tags.append(found.group(1).lower())
@@ -561,17 +562,44 @@ def _blocker_tokens(payload: str) -> list[str]:
 
 
 def _contains_tokens(haystack: list[str], needle: list[str]) -> bool:
-    """True if `needle` appears in `haystack` as a contiguous run of whole tokens.
+    """True if every `needle` token appears in `haystack`, in order, as a whole token.
 
-    Whole tokens, not a substring: `auth` must not match `authors`. Contiguous, not a subset, so
-    `sink-lock` matches `make-the-sink-lock-durable` but not `sink-the-other-lock`.
+    Whole tokens, not a substring: `auth` must not match `authors`. In order but NOT contiguous,
+    because a marker's slug is the item's abbreviated short name while a subject is the full
+    slugified title, stopwords and all: PR #258's own case is the payload
+    `skill-run-sink-cross-process-append-lock` against the heading
+    `harness-skill-run-sink-has-no-cross-process-append-lock` — a subsequence, never a run. A
+    contiguous test passes hand-written fixtures and misses every real marker.
     """
     if not needle or len(needle) > len(haystack):
         return False
-    return any(
-        haystack[i:i + len(needle)] == needle
-        for i in range(len(haystack) - len(needle) + 1)
-    )
+    it = iter(haystack)
+    return all(any(h == t for h in it) for t in needle)
+
+
+def _line_owners(masked: list[str], levels: dict[int, int]) -> tuple[dict[int, int], dict[int, str]]:
+    """`({line index: owning checkbox line}, {checkbox line: state char})`.
+
+    A wrapped item's continuation lines belong to the checkbox that opened it, so a marker on a
+    continuation line resolves to the same item as one written inline. Without this the owner test
+    below compares a continuation index against a checkbox index, never matches, and the item
+    suppresses its own warning. A blank line or a heading ends the item, matching how `tokenize`
+    folds continuations.
+    """
+    owner: dict[int, int] = {}
+    state: dict[int, str] = {}
+    current: int | None = None
+    for i, ln in enumerate(masked):
+        if not ln.strip() or i in levels:
+            current = None
+            continue
+        m = _CHECKBOX_LINE_RE.match(ln)
+        if m:
+            current = i
+            state[i] = m.group(1)
+        if current is not None:
+            owner[i] = current
+    return owner, state
 
 
 def orphaned_blockers(original: str, removed: list[str], new_text: str, label: str) -> list[str]:
@@ -589,13 +617,16 @@ def orphaned_blockers(original: str, removed: list[str], new_text: str, label: s
       - its payload holds no `<placeholder>`, so prose quoting the syntax is not a blocker;
       - it survives outside a fence or an HTML comment, per the masked view the pruner already
         trusts for deletion — a marker inside a sample is markup;
-      - no *other* surviving open item still answers to the same slug, which would mean the
-        blocker is alive and this marker is fine.
+      - no *other* surviving OPEN item still answers to the same slug, which would mean the
+        blocker is alive and this marker is fine. A `[x]`/`[>]` item is not a live blocker — a
+        landed blocker is precisely the marker that needs clearing — and neither is a fellow
+        blockee carrying the same marker, or two items waiting on one pruned blocker would
+        silence each other and both stay unselectable.
     """
     subjects: list[tuple[str, list[str]]] = []
     for raw in removed:
         m = _CHECKBOX_LINE_RE.match(raw)
-        body = m.group(1) if m else raw
+        body = m.group(2) if m else raw
         tokens = _slug_tokens(body)
         if tokens:
             subjects.append((slugify(body), tokens))
@@ -614,12 +645,23 @@ def orphaned_blockers(original: str, removed: list[str], new_text: str, label: s
     masked = _strip_fenced_blocks(_strip_html_comments(new_text)).splitlines()
     if len(masked) != len(lines):  # same fail-safe as `prune_lines`: warn about nothing, not wrongly
         return []
-    # Each surviving open item's own markers are stripped before tokenizing, so an item does not
-    # count as the blocker it is waiting on.
+    owner, state = _line_owners(masked, _heading_levels(new_text))
+    # Per surviving item: its own text minus its own markers (an item is never the blocker it
+    # waits on), and the blocker slugs it is itself waiting on.
+    bodies: dict[int, list[str]] = {}
+    waiting: dict[int, list[list[str]]] = {}
+    for i, ln in enumerate(masked):
+        item = owner.get(i)
+        if item is None:
+            continue
+        bodies.setdefault(item, []).append(_BLOCK_MARKER_RE.sub(" ", ln))
+        for marker in _BLOCK_MARKER_RE.finditer(ln):
+            if marker.group(1).lower() == "blocked by":
+                waiting.setdefault(item, []).append(_blocker_tokens(marker.group(2)))
     survivors = {
-        i: _slug_tokens(_BLOCK_MARKER_RE.sub(" ", m.group(1)))
-        for i, ln in enumerate(masked)
-        if (m := _CHECKBOX_LINE_RE.match(ln))
+        item: _slug_tokens(" ".join(parts))
+        for item, parts in bodies.items()
+        if state.get(item) == " "
     }
 
     findings: dict[str, list[str]] = {}
@@ -635,7 +677,12 @@ def orphaned_blockers(original: str, removed: list[str], new_text: str, label: s
             hit = next((s for s in subjects if _contains_tokens(s[1], tokens)), None)
             if hit is None:
                 continue
-            if any(_contains_tokens(toks, tokens) for j, toks in survivors.items() if j != i):
+            this_item = owner.get(i)
+            if any(
+                _contains_tokens(toks, tokens)
+                for j, toks in survivors.items()
+                if j != this_item and tokens not in waiting.get(j, [])
+            ):
                 continue
             hits = findings.setdefault(hit[0], [])
             entry = f"  {label}:{i + 1}: {lines[i].strip()}"
@@ -1398,6 +1445,78 @@ Preamble with no h1 wrapper.
         orphaned_blockers(numeric_src, [ph_done], n_pruned, "backlog.md") == [],
         "a number-only payload identifies nothing and must match nothing, not everything",
     )
+    # REGRESSION (PR #269 review): the real PR #258 shape — an abbreviated marker slug against a
+    # slugified heading full of stopwords is an order-preserving subsequence, never a contiguous
+    # run. A contiguous test passed every fixture above and missed the only case that mattered.
+    real_src = """# Backlog
+
+## Sink lock
+
+- [ ] [HARNESS] skill-run sink has no cross-process append lock
+
+## Follow-ups
+
+- [ ] [HARNESS] Report contention *(blocked by: skill-run-sink-cross-process-append-lock)*
+"""
+    real_done = "- [ ] [HARNESS] skill-run sink has no cross-process append lock"
+    real_pruned, _ = prune_lines(real_src, [real_done])
+    _assert(
+        any("cross-process-append-lock" in w for w in
+            orphaned_blockers(real_src, [real_done], real_pruned, "backlog.md")),
+        "REGRESSION: an abbreviated marker slug matches its subject as a subsequence, not a run",
+    )
+
+    # REGRESSION (PR #269 review): two items waiting on one pruned blocker are fellow blockees, not
+    # each other's blocker. Counting them as live silenced both and left both unselectable.
+    siblings_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [FEAT] Sink lock telemetry *(blocked by: sink-lock)*
+- [ ] [FEAT] Sink lock dashboards *(blocked by: sink-lock)*
+"""
+    sib_done = "- [ ] [FEAT] Make the sink lock durable"
+    sib_pruned, _ = prune_lines(siblings_src, [sib_done])
+    sib_out = orphaned_blockers(siblings_src, [sib_done], sib_pruned, "backlog.md")
+    _assert(
+        len(sib_out) == 3 and sum(1 for w in sib_out if w.startswith("  ")) == 2,
+        "REGRESSION: sibling blockees do not suppress each other — both orphaned lines are reported",
+    )
+
+    # REGRESSION (PR #269 review): a marker on a continuation line belongs to its own item, so the
+    # owner test must resolve it back to the checkbox line or the item silences itself.
+    wrapped_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [ ] [FEAT] Report contention, a long item whose marker wrapped
+      onto the next line *(blocked by: sink-lock)*
+"""
+    wrapped_pruned, _ = prune_lines(wrapped_src, [sib_done])
+    _assert(
+        any(w.startswith("  ") for w in
+            orphaned_blockers(wrapped_src, [sib_done], wrapped_pruned, "backlog.md")),
+        "REGRESSION: a marker on a continuation line still reports — the item is not its own blocker",
+    )
+
+    # REGRESSION (PR #269 review): a landed `[x]` blocker is exactly the marker that needs clearing.
+    closed_src = """# Backlog
+
+## Group
+
+- [ ] [FEAT] Make the sink lock durable
+- [x] [FEAT] Make the sink lock durable again
+- [ ] [FEAT] Report contention *(blocked by: sink-lock)*
+"""
+    closed_pruned, _ = prune_lines(closed_src, [sib_done])
+    _assert(
+        any(w.startswith("  ") for w in
+            orphaned_blockers(closed_src, [sib_done], closed_pruned, "backlog.md")),
+        "REGRESSION: a closed [x] item is not a live blocker, so it cannot suppress the warning",
+    )
+
     _assert(
         orphaned_blockers("", [], "", "backlog.md") == []
         and orphaned_blockers(orphan_src, [], pruned, "backlog.md") == []

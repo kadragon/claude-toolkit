@@ -168,13 +168,17 @@ SPRINT_SECTION_TITLES = frozenset(
 def _is_blocked(text: str) -> bool:
     """True if `text` (the checkbox item body) carries a *resolvable* deferred/blocked-by marker.
 
-    A marker whose payload holds an angle-bracket placeholder is prose quoting the syntax — an item
-    about the marker format, or a template — so it parks nothing. Without this, an item that merely
-    documents `*(blocked by: <slug>)*` is filtered out of candidate selection permanently, because
-    there is no blocker to land and no marker anyone would think to clear.
+    A `blocked by` marker whose payload holds an angle-bracket placeholder is prose quoting the
+    syntax — an item about the marker format, or a template — so it parks nothing. Without this, an
+    item that merely documents `*(blocked by: <slug>)*` is filtered out of candidate selection
+    permanently, because there is no blocker to land and no marker anyone would think to clear.
+
+    The escape hatch is scoped to `blocked by` on purpose. A `deferred` payload is free prose that
+    may legitimately contain `<v2>` or `<team>`; treating those as placeholders would un-park an
+    item somebody deliberately deferred, which is the opposite failure.
     """
     return any(
-        not _MARKER_PLACEHOLDER_RE.search(m.group(2))
+        not (m.group(1).lower() == "blocked by" and _MARKER_PLACEHOLDER_RE.search(m.group(2)))
         for m in _BLOCK_MARKER_RE.finditer(text)
     )
 
@@ -929,6 +933,11 @@ status: open
     _assert(
         _is_blocked("item *(blocked by: <slug>)* *(blocked by: 3-add-auth)*") is True,
         "one real marker still parks an item that also quotes a placeholder one",
+    )
+    _assert(
+        _is_blocked("item *(deferred: waiting on <team> reply)*") is True,
+        "REGRESSION: the placeholder escape hatch is scoped to `blocked by` — a real deferral with "
+        "angle brackets in its reason stays parked",
     )
     placeholder_prose = """## Marker docs
 - [ ] [HARNESS] Warn when a pruned item is still named by a `*(blocked by: <slug>)*` marker
