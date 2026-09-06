@@ -120,7 +120,15 @@ _STATUS_RE = re.compile(r"^status:\s*(\S+)")
 _CHECKBOX_RE = re.compile(r"^-\s*\[([ xX>])\]\s*(.*)$")
 # Generalized skip marker: `*(deferred: ...)*` or `*(blocked by: <n>-<slug>)*` — both mean
 # "otherwise-open item is not actually actionable yet", same treatment as a `[>]` checkbox.
-_BLOCK_MARKER_RE = re.compile(r"\*\(\s*(?:deferred|blocked by)\s*:.*?\)\*", re.IGNORECASE)
+# Group 1 is the keyword and group 2 the payload (the reason, or the blocker's `<n>-<slug>`).
+# `_is_blocked` inspects the payload; `task_nodes.orphaned_blockers` selects `blocked by` markers by
+# the keyword and resolves their payload against the items a prune run deleted.
+_BLOCK_MARKER_RE = re.compile(r"\*\(\s*(deferred|blocked by)\s*:(.*?)\)\*", re.IGNORECASE)
+# A payload naming an angle-bracket placeholder (`<slug>`, `<n>-<slug>`, `<reason>`) is a
+# documentation example of the syntax, not a blocker anyone can resolve. Real markers name a
+# concrete kebab slug or reason and never contain `<`/`>`; an item describing the marker format in
+# its own prose would otherwise park itself forever, with no blocker to clear.
+_MARKER_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
 # HTML comments hold format templates (`## Feature Name` / `- [ ] Simplest case`) that must
 # never surface as candidates.
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -158,8 +166,17 @@ SPRINT_SECTION_TITLES = frozenset(
 
 
 def _is_blocked(text: str) -> bool:
-    """True if `text` (the checkbox item body) carries a deferred/blocked-by marker."""
-    return bool(_BLOCK_MARKER_RE.search(text))
+    """True if `text` (the checkbox item body) carries a *resolvable* deferred/blocked-by marker.
+
+    A marker whose payload holds an angle-bracket placeholder is prose quoting the syntax — an item
+    about the marker format, or a template — so it parks nothing. Without this, an item that merely
+    documents `*(blocked by: <slug>)*` is filtered out of candidate selection permanently, because
+    there is no blocker to land and no marker anyone would think to clear.
+    """
+    return any(
+        not _MARKER_PLACEHOLDER_RE.search(m.group(2))
+        for m in _BLOCK_MARKER_RE.finditer(text)
+    )
 
 
 def _strip_html_comments(text: str) -> str:
@@ -900,6 +917,25 @@ status: open
     _assert(
         _is_blocked("item *(deferred: waiting on (infra) service)*") is True,
         "_is_blocked is True when the reason text has nested parens (non-greedy match, not [^)]*)",
+    )
+    _assert(
+        _is_blocked("item quoting the `*(blocked by: <slug>)*` syntax") is False,
+        "_is_blocked is False for a placeholder payload — prose about the marker parks nothing",
+    )
+    _assert(
+        _is_blocked("template line *(blocked by: <n>-<slug>)*") is False,
+        "_is_blocked is False for the `<n>-<slug>` template payload",
+    )
+    _assert(
+        _is_blocked("item *(blocked by: <slug>)* *(blocked by: 3-add-auth)*") is True,
+        "one real marker still parks an item that also quotes a placeholder one",
+    )
+    placeholder_prose = """## Marker docs
+- [ ] [HARNESS] Warn when a pruned item is still named by a `*(blocked by: <slug>)*` marker
+"""
+    _assert(
+        [c["title"] for c in backlog_fast_candidates(tokenize(placeholder_prose))] == ["Marker docs"],
+        "an item whose prose quotes the placeholder marker is still a candidate",
     )
 
     # ---- Test 3b2: multi-line items — marker on a continuation line still parks the item ----
