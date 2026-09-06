@@ -24,10 +24,6 @@ Re-filing requires evidence of the specific kind each item failed on, not a rest
 
 - [ ] [HARNESS] Consider keeping `--panel` on for any diff that adds or changes a *shipped script* under `dev/`/`prod/`, not only at the 300-line / security-path thresholds `task-review-cycle` routes on today. Recorded on PR #267: the three review sources converged on the one obvious defect (an unlocked read-modify-write in `flush()`) but the third source was the only one to find a shell-expansion path — note text passed as `--field "$(...)"` is expanded before the script sees it — and a missing `python3`-shim fallback that `docs/platform-specs.md` already mandates. Both are script-shaped defects a prose-diff reviewer has no reason to look for. Needs a threshold that does not turn the panel on for every skill-doc edit
 
-### PR #266 — review sidecar follow-ups
-
-- [ ] [FIX] Make `ci-wait.sh` distinguish "this PR has no CI configured" from "checks have not registered yet" — recorded in PR #266: called immediately after a push, it returned `{"passed": true, "reason": "no CI checks found"}` while GitHub Actions run 33941974204 was starting for that exact commit, and 14 checks then ran. A merge driven by that answer would have merged before CI existed. Needs a grace window (poll for a check set to appear before concluding none exists) or a distinct non-passing reason the caller must resolve
-
 ### PR #258 — skill-run sink lock follow-ups
 
 - [ ] [HARNESS] Have `task_nodes.py prune-backlog` warn when a pruned item is still named as somebody else's blocker — grep the surviving `*(blocked by: <slug>)*` markers for the deleted item's slug and print the orphaned lines. PR #258 deleted the sink-lock item and left the follow-up at `backlog.md:56` carrying its marker, which `backlog_candidates.py` filters, so that item would have been permanently unselectable; Codex caught it in review. `task-next`'s Blocked-analysis sync covers marking newly-blocked items and clearing markers whose blocker resolved, but the completing run has no prompt to check whether *it* was the blocker

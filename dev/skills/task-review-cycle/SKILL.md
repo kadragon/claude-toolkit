@@ -223,7 +223,7 @@ continue on the hub path from Step 1's PR block. Report: "라이트 패스 완�
 푸시됨. PR·CI 없음."
 
 **Hub path** — follow `references/ci-failure-handling.md`: `scripts/ci-wait.sh <PR_NUMBER>`
-(15 min; `reason:"rework-cap"` and `reason:"timeout"` stop and ask), then reclaim a skipped codex source after CI green (`references/late-source-reclaim.md`), then:
+(15 min; `reason:"rework-cap"`, `reason:"timeout"` and `reason:"checks-never-registered"` stop and ask), then reclaim a skipped codex source after CI green (`references/late-source-reclaim.md`), then:
 
 ```bash
 SKILL_DIR="<absolute parent directory of the loaded SKILL.md>"
@@ -241,7 +241,7 @@ bash "$SKILL_DIR/scripts/merge-and-cleanup.sh" <PR_NUMBER> <BASE_BRANCH> <FEATUR
 | Reviewer sentinel or >1200s | Inline review, note it in the report (this slot persists nothing) |
 | Panel source fails, exits 75, or >1200s | Record `Reviewers Skipped: <reason>`, proceed; codex breach or failure → reclaim before merge |
 | Contract finding still open after the one retry | Stop; no Step 5, no merge |
-| CI `rework-cap` / `timeout` | Stop, ask the user |
+| CI `rework-cap` / `timeout` / `checks-never-registered` | Stop, ask the user |
 | Merge fails (`merge_ok: false`) | Report; never force-delete |
 
 Scripts: `preflight.sh` (probes, cached per branch), `commit-and-push.sh` (stage, guard, commit,

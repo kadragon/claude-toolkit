@@ -48,9 +48,12 @@ def check(name, condition, detail=""):
     _results.append(condition)
 
 
-def make_repo(tmp: Path, status: str) -> Path:
-    """A git repo holding ci-wait.sh next to a hub.sh stub that always reports `status`."""
-    repo = tmp / status.replace(" ", "_")
+def make_repo(tmp: Path, status: str, name: str = "") -> Path:
+    """A git repo holding ci-wait.sh next to a hub.sh stub that always reports `status`.
+
+    `name` overrides the directory, so two repos can share a status.
+    """
+    repo = tmp / (name or status.replace(" ", "_"))
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -215,6 +218,91 @@ def main() -> int:
               and result.get("reason") == "no CI checks found", f"got {result}")
         check("and clears the strike file like a real pass",
               not strike_file(no_ci).exists())
+
+        print("\n-- a repo WITH CI configured never passes on an unregistered check set --")
+        configured = make_repo(tmp, "none", name="none_configured")
+        (configured / ".github" / "workflows").mkdir(parents=True)
+        (configured / ".github" / "workflows" / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        strike_file(configured).write_text("2\n", encoding="utf-8")
+        result = run(configured, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=1, CI_WAIT_POLL_INTERVAL=1)
+        check("checks that never register report passed=false",
+              result.get("passed") is False
+              and result.get("reason") == "checks-never-registered", f"got {result}")
+        check("and leave the strike counter untouched — it is not rework",
+              strike_file(configured).exists()
+              and strike_file(configured).read_text().strip() == "2")
+
+        print("\n-- a Forgejo/Gitea workflow directory counts as CI configured too --")
+        forgejo = make_repo(tmp, "none", name="none_forgejo")
+        (forgejo / ".forgejo" / "workflows").mkdir(parents=True)
+        (forgejo / ".forgejo" / "workflows" / "ci.yaml").write_text("on: pull_request\n", encoding="utf-8")
+        result = run(forgejo, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=1, CI_WAIT_POLL_INTERVAL=1)
+        check("a .forgejo/workflows entry blocks the no-CI pass",
+              result.get("passed") is False
+              and result.get("reason") == "checks-never-registered", f"got {result}")
+
+        print("\n-- a push-only workflow does not make CI 'configured' for a PR --")
+        push_only = make_repo(tmp, "none", name="none_push_only")
+        (push_only / ".github" / "workflows").mkdir(parents=True)
+        (push_only / ".github" / "workflows" / "deploy.yml").write_text(
+            "on:\n  push:\n    branches: [main]\n", encoding="utf-8")
+        result = run(push_only, CI_WAIT_NO_CHECKS_GRACE_SECS=0, CI_WAIT_POLL_INTERVAL=1)
+        check("a workflow with no PR trigger still passes as no-CI",
+              result.get("passed") is True
+              and result.get("reason") == "no CI checks found", f"got {result}")
+
+        print("\n-- a non-YAML file in the workflows dir does not make CI 'configured' --")
+        keep_only = make_repo(tmp, "none", name="none_gitkeep")
+        (keep_only / ".github" / "workflows").mkdir(parents=True)
+        (keep_only / ".github" / "workflows" / ".gitkeep").write_text("", encoding="utf-8")
+        (keep_only / ".github" / "workflows" / "README.md").write_text(
+            "workflows run on pull_request\n", encoding="utf-8")
+        result = run(keep_only, CI_WAIT_NO_CHECKS_GRACE_SECS=0, CI_WAIT_POLL_INTERVAL=1)
+        check("a .gitkeep/README leftover still passes as no-CI",
+              result.get("passed") is True
+              and result.get("reason") == "no CI checks found", f"got {result}")
+
+        print("\n-- a symlinked workflow file counts as CI configured --")
+        linked = make_repo(tmp, "none", name="none_symlink")
+        (linked / ".github" / "workflows").mkdir(parents=True)
+        (linked / "shared-ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        (linked / ".github" / "workflows" / "ci.yml").symlink_to(linked / "shared-ci.yml")
+        result = run(linked, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=1, CI_WAIT_POLL_INTERVAL=1)
+        check("a symlinked workflow blocks the no-CI pass",
+              result.get("passed") is False
+              and result.get("reason") == "checks-never-registered", f"got {result}")
+
+        print("\n-- a zero configured-grace override falls back to the default --")
+        zero_grace = make_repo(tmp, "none", name="none_zero_grace")
+        (zero_grace / ".github" / "workflows").mkdir(parents=True)
+        (zero_grace / ".github" / "workflows" / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        result = run(zero_grace, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS=0, CI_WAIT_TIMEOUT_SECS=1,
+                     CI_WAIT_POLL_INTERVAL=1)
+        check("a zero grace does not report checks-never-registered on the first poll",
+              result.get("passed") is False and result.get("reason") == "timeout", f"got {result}")
+
+        print("\n-- an empty workflow directory is not CI configured --")
+        empty_dir = make_repo(tmp, "none", name="none_empty_workflows")
+        (empty_dir / ".github" / "workflows").mkdir(parents=True)
+        result = run(empty_dir, CI_WAIT_NO_CHECKS_GRACE_SECS=0, CI_WAIT_POLL_INTERVAL=1)
+        check("an empty workflows dir still passes as no-CI",
+              result.get("passed") is True
+              and result.get("reason") == "no CI checks found", f"got {result}")
+
+        print("\n-- a garbage configured-grace override falls back, it does not kill the script --")
+        garbage = make_repo(tmp, "none", name="none_garbage_grace")
+        (garbage / ".github" / "workflows").mkdir(parents=True)
+        (garbage / ".github" / "workflows" / "ci.yml").write_text("on: pull_request\n", encoding="utf-8")
+        result = run(garbage, CI_WAIT_NO_CHECKS_GRACE_SECS=0,
+                     CI_WAIT_CONFIGURED_GRACE_SECS="abc", CI_WAIT_TIMEOUT_SECS=1,
+                     CI_WAIT_POLL_INTERVAL=1)
+        check("a non-numeric grace keeps the default and still emits JSON",
+              result.get("passed") is False
+              and result.get("reason") in ("timeout", "checks-never-registered"), f"got {result}")
 
         print("\n-- a garbage cap override falls back to 3, it does not kill the script --")
         capped = make_repo(tmp, "failure0")
