@@ -41,10 +41,21 @@ with it.
 The store is untracked by construction: everything under `.git/` is outside the working tree,
 so notes never ride into a commit and never need a `.gitignore` entry.
 
-**Parallel writers.** Each note is one appended line, so two agents capturing at once cannot
-truncate each other's work; they can land the same `id`. That is a label collision, not data
-loss — the file keeps both lines and `list` renders both. Do not "fix" it by pre-computing ids
-for a batch: resolve the id at each write, which is what `add` already does.
+**Parallel writers.** `add` and `flush` both take an exclusive `flock` on a `notes.jsonl.lock`
+sidecar, so a capture landing while another agent is flushing is serialised rather than
+discarded. The lock is on a sidecar, not on the store: `flush` replaces the store file, and a
+descriptor held on a replaced inode guards nothing. Where `fcntl` is unavailable (Windows) the
+lock degrades to a no-op — single-writer use is unaffected, and the degradation is stated here
+rather than silently assumed away.
+
+Two writers can still land the same `id`. That is a label collision, not data loss — the file
+keeps both lines and `list` renders both. Do not "fix" it by pre-computing ids for a batch:
+resolve the id at each write, which is what `add` already does.
+
+**Never pass note text as a shell argument.** A note quotes what happened — an error message,
+the user's words, a diff — and `$(...)` inside any of that is expanded by the shell before the
+script sees it. `add --from-json <file>` (or `-` for stdin) is the route that has no shell in
+it; the `--title/--issue/...` flags remain for short text you authored literally.
 
 ## The note shape
 
@@ -100,15 +111,15 @@ of the input — the same model that produced the gap.
 
 | Output | Exit | Means |
 |--------|------|-------|
-| `NO-STORE <path>` | 2 | the file does not exist — nothing was ever captured, **or** the path is wrong |
+| `NO-STORE <path>` | 2 (`status`/`list`), 0 (`flush`) | the file does not exist — nothing was ever captured, **or** the path is wrong |
 | `EMPTY <path> (n note(s), all flushed)` | 0 | the store exists and every note has been routed |
 | `PENDING n <path>` | 0 | n notes are waiting for the retrospective |
 
 The distinction is the whole point of the exit code. A single `0` for both of the first two
 rows would let a broken path read as a quiet session, and a broken path is the failure that
-lasts the rest of the session. Likewise `read_notes` raises on a malformed line rather than
-skipping it: a store that parses to zero notes because it is corrupt must not present as a
-store with zero notes.
+lasts the rest of the session. Likewise `read_notes` raises on a malformed line, or on a record missing one of the four body
+fields, rather than skipping it: a store that parses to zero notes because it is corrupt must
+not present as a store with zero notes.
 
 Generalise it past this script — **every retrieval reports on two possibilities at once (the
 data is absent, or the question never got asked), and only the second is a defect a "0"

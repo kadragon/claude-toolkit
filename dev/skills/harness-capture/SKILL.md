@@ -28,17 +28,30 @@ Not for cross-project audits, unused-skill cleanup, or building a named asset �
 The retrospective's failure mode was never a bad gate — it was that nothing reached the gate. A
 signal noticed at turn 12 and recalled at turn 90 is a signal a compaction can delete, and
 "remember to mention this later" fails hardest in exactly the sessions that produce the best
-material. So the capture is a write, at the moment, not an intention:
+material. So the capture is a write, at the moment, not an intention.
+
+**Write the note as a JSON file, then hand the file to the store.** A note quotes what actually
+happened — an error message, the user's words, a diff — and text like that can contain `$(...)`,
+which the shell expands before the script ever sees it. Same reason the memory-guard pre-check
+below takes a file rather than a command line. Draft it with the `Write` tool, outside the store:
 
 ```sh
 SKILL_DIR="<absolute parent directory of the loaded SKILL.md>"
 NOTES="$SKILL_DIR/scripts/session_notes.py"
-python3 "$NOTES" add --title "flush trigger never fired" \
-  --issue "what happened, specific enough to reconstruct without this conversation" \
-  --improvement "the concrete delta — name the file and section, or the missing asset" \
-  --principle "the generalisable takeaway; blank means it was task context, not a lesson" \
-  --target dev:task-next        # optional: the asset the note is about
+DRAFT="<absolute path of the scratch .json file you just wrote>"
+PY=$(command -v python3 || command -v python || true)
+if [ -n "$PY" ]; then "$PY" "$NOTES" add --from-json "$DRAFT"; else echo "no python on PATH" >&2; fi
 ```
+
+The draft is one JSON object. All four bodies are mandatory and refused empty:
+
+| Field | What goes in it |
+|-------|-----------------|
+| `title` | one line, so a later scan can tell the notes apart |
+| `issue` | what happened, specific enough to reconstruct weeks later without this conversation |
+| `improvement` | the concrete delta — name the file and section, or the asset that does not exist yet |
+| `principle` | the generalisable takeaway. If you cannot state one, this was task context: do not capture it |
+| `target` | optional — the asset the note is about (`dev:task-next`, `docs/conventions.md`, a hook) |
 
 **Two triggers, both bound to something already in the tool record** — never to noticing that a
 moment qualifies:
@@ -46,14 +59,25 @@ moment qualifies:
 1. **Capture** — a user correction, an error→recovery gotcha, or a workflow you would repeat
    surfaces. Write the note in the same turn or the next.
 2. **Flush** — any action declaring a unit of work complete: a commit, a PR opened or merged, a
-   final report, a queue item marked done, or this skill being invoked. Run
-   `python3 "$NOTES" list`, route what it returns through *How to run* below, then
-   `python3 "$NOTES" flush`.
+   final report, a queue item marked done, or this skill being invoked. List, route what it
+   prints through *How to run* below, then flush **through the highest id it listed** — a bare
+   flush would also retire a note captured while you were routing, which would leave the queue
+   having never been read:
+
+```sh
+SKILL_DIR="<absolute parent directory of the loaded SKILL.md>"
+NOTES="$SKILL_DIR/scripts/session_notes.py"
+PY=$(command -v python3 || command -v python || true)
+if [ -n "$PY" ]; then "$PY" "$NOTES" list; fi          # route what it prints, then:
+THROUGH="<highest note id the list above showed>"
+if [ -n "$PY" ]; then "$PY" "$NOTES" flush --through "$THROUGH"; fi
+```
 
 `status` and `list` separate three states, and the exit code is the point: `NO-STORE` (exit 2) —
 nothing captured **or** the path is wrong; `EMPTY` (exit 0) — captured and already routed;
 `PENDING n` (exit 0). Never read a zero as "quiet session" without the code that says which one
-it was. If notes you wrote are missing, stop and check the path before writing anything else.
+it was. A quiet session needs no flush at all: on an absent store `flush` reports `NO-STORE` and
+exits 0. If notes you wrote are missing, stop and check the path before writing anything else.
 
 Store path, note schema, parallel writers, compaction recovery, and the reasoning behind each
 rule: `references/session-notes.md`. Load it on first setup, on any unexpected command output,
@@ -61,7 +85,7 @@ or after a compaction.
 
 ## How to run
 
-1. **Reflect.** Start from `python3 "$NOTES" list` — the notes are the record, not your recall
+1. **Reflect.** Start from the `list` block above — the notes are the record, not your recall
    of them — then add anything the session produced since the last capture. Three kinds of
    signal: a **reusable workflow** you would repeat across sessions; an **error → recovery**
    that revealed a durable setup gotcha or approach correction; a **user correction** of your
@@ -94,8 +118,8 @@ or after a compaction.
    fallback. Every proposal names in one line **the concrete failure this prevents** ("without
    this: X happens again") — for memory it lands in the body.
 
-4. Nothing clears the gate → say so in one line and stop, then `flush` anyway so the next
-   retrospective does not re-litigate the same notes. That is the normal outcome.
+4. Nothing clears the gate → say so in one line and stop, then flush the ids you just read so
+   the next retrospective does not re-litigate them. That is the normal outcome.
 
 **Deferring is a decision, not a neutral hold.** Before writing any "later", name which specific
 observation would change the decision and when it could realistically arrive; if you cannot,
@@ -116,8 +140,9 @@ new skill, a skill overhaul, a multi-file rewrite — goes to `backlog.md` as a 
 `--auto` do not pause for the per-write veto; the review and CI are the safety net, and a
 destructive memory prune is deferred to `backlog.md` rather than blocking.
 
-The cycle's call is itself a flush trigger: read the pending notes first, and `flush` once
-they are routed, so the commit and the note store agree about what this session learned.
+The cycle's call is itself a flush trigger: list the pending notes first, and flush through the
+highest id listed once they are routed, so the commit and the note store agree about what this
+session learned.
 
 ## Writing to auto-memory
 
@@ -174,11 +199,13 @@ repairs the index.
 
 ## Additional Resources
 
-- **`scripts/session_notes.py`** — the note store behind *Capture on the spot*: `add` (the four
-  fields are mandatory and rejected empty, over 2000 chars, or carrying control/zero-width/bidi
-  characters), `list`, `status`, `flush`. The path resolves from `git rev-parse --git-common-dir`,
-  so one repo has one store shared by every worktree — never a cwd-relative path. `--test` covers
-  the schema, the exit codes, and the worktree case.
+- **`scripts/session_notes.py`** — the note store behind *Capture on the spot*: `add`
+  (`--from-json` keeps note text away from the shell; the four fields are mandatory and rejected
+  empty, over 2000 chars, or carrying any character `check_asset_hygiene.py` bans), `list`,
+  `status`, `flush --through N`. The path resolves from `git rev-parse --git-common-dir`, so one
+  repo has one store shared by every worktree — never a cwd-relative path, and `add` and `flush`
+  take a lock so a concurrent capture cannot be dropped. `--test` covers the schema, each banned
+  character family, the exit codes, the scoped flush, the lock, and the worktree case.
 - **`references/session-notes.md`** — store layout, flush-trigger reasoning, parallel writers,
   compaction recovery, the sibling/cross-cutting rules in full, and the CC BY 4.0 attribution for
   the methodology this capture layer adapts.
